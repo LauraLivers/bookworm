@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Word Explainer</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; display: grid;
+         grid-template-columns: 1fr minmax(300px, 35%); height: 100vh; }
+  main, aside { padding: 16px; overflow: auto; }
+  aside { border-left: 1px solid #8884; }
+  textarea { width: 100%; height: 55vh; font: inherit; font-size: 1.05rem; padding: 8px; }
+  button, select { font: inherit; padding: 4px 10px; }
+  .bar { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  #reader { white-space: pre-wrap; line-height: 1.9; font-size: 1.2rem; max-width: 75ch; }
+  .w { cursor: pointer; border-radius: 3px; }
+  .w:hover { background: #ffe58a; color: #000; }
+  .w.active { background: #ffcc33; color: #000; }
+  #output { white-space: pre-wrap; line-height: 1.5; }
+  .muted { opacity: .65; font-size: .9rem; }
+  .hidden { display: none; }
+  @media (max-width: 800px) {
+    body { grid-template-columns: 1fr; height: auto; }
+    aside { border-left: 0; border-top: 1px solid #8884; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="bar">
+    <label>Model <select id="model"></select></label>
+    <span id="status" class="muted"></span>
+  </div>
+
+  <section id="inputView">
+    <textarea id="input" placeholder="Paste a text in any language…"></textarea>
+    <p><button id="readBtn">Read text</button></p>
+  </section>
+
+  <section id="readView" class="hidden">
+    <div class="bar">
+      <button id="editBtn">Edit text</button>
+      <span class="muted">Click a word, or drag across several words to explain a phrase.</span>
+    </div>
+    <div id="reader"></div>
+  </section>
+</main>
+
+<aside>
+  <h2 id="selTitle">Explanation</h2>
+  <div id="output" class="muted">Click a word in the text.</div>
+</aside>
+
+<script>
+const $ = id => document.getElementById(id);
+let sentences = [];      // sentence text by index; each word span stores its sentence index
+let controller = null;   // aborts the running request when a new word is clicked
+let lastKey = null;
+
+// ---------- storage helpers (text + model survive a page reload) ----------
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+// ---------- splitting text into sentences and words ----------
+// Intl.Segmenter handles most languages (incl. Chinese/Japanese/Thai without spaces).
+function segment(text, granularity) {
+  if (window.Intl && Intl.Segmenter) {
+    return [...new Intl.Segmenter(undefined, { granularity }).segment(text)]
+      .map(s => ({ text: s.segment, isWord: granularity === "word" ? s.isWordLike : true }));
+  }
+  // Fallback for old browsers
+  if (granularity === "sentence") {
+    return (text.match(/[^.!?。！？\n]+[.!?。！？]*\s*|\n+/g) || [text]).map(t => ({ text: t, isWord: true }));
+  }
+  return (text.match(/[\p{L}\p{M}\p{N}'’-]+|[^\p{L}\p{M}\p{N}'’-]+/gu) || [])
+    .map(t => ({ text: t, isWord: /[\p{L}\p{N}]/u.test(t) }));
+}
+
+function render(text) {
+  const box = $("reader");
+  box.replaceChildren();
+  sentences = [];
+  for (const s of segment(text, "sentence")) {
+    const si = sentences.push(s.text.trim()) - 1;
+    for (const w of segment(s.text, "word")) {
+      if (w.isWord) {
+        const span = document.createElement("span");
+        span.className = "w";
+        span.dataset.s = si;
+        span.textContent = w.text;
+        box.append(span);
+      } else {
+        box.append(document.createTextNode(w.text));
+      }
+    }
+  }
+}
+
+// ---------- clicking / selecting ----------
+function markActive(spans) {
+  document.querySelectorAll(".w.active").forEach(el => el.classList.remove("active"));
+  spans.forEach(el => el.classList.add("active"));
+}
+
+$("reader").addEventListener("mouseup", e => {
+  const sel = window.getSelection();
+  const picked = sel.toString().trim();
+  if (picked) {
+    // Phrase selected by dragging
+    const spans = [...$("reader").querySelectorAll(".w")].filter(el => sel.containsNode(el, true));
+    if (!spans.length) return;
+    markActive(spans);
+    explain(picked, +spans[0].dataset.s, +spans[spans.length - 1].dataset.s);
+    return;
+  }
+  const w = e.target.closest(".w");
+  if (w) {
+    markActive([w]);
+    explain(w.textContent, +w.dataset.s);
+  }
+});
+
+// ---------- asking the backend ----------
+function cleanAnswer(t) {
+  // Remove any <think>…</think> block some models emit
+  return t.replace(/<think>[\s\S]*?(<\/think>|$)/g, "").trim();
+}
+
+async function explain(word, sFrom, sTo = sFrom) {
+  word = word.replace(/\s+/g, " ");
+  const sentence = sentences.slice(sFrom, sTo + 1).join(" ");
+  const context = sentences.slice(Math.max(0, sFrom - 1), sTo + 2).join(" ");
+  const model = $("model").value;
+  const key = [model, word, sentence].join("\u0000");
+  if (key === lastKey) return;   // same word clicked again (e.g. double-click)
+  lastKey = key;
+
+  if (controller) controller.abort();
+  const ctrl = controller = new AbortController();
+  const out = $("output");
+  $("selTitle").textContent = word;
+  out.classList.add("muted");
+  out.textContent = "Thinking…";
+
+  let text = "";
+  try {
+    const res = await fetch("/api/explain", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ word, sentence, context, model }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.error || `Server error ${res.status}`);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    out.classList.remove("muted");
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      text += dec.decode(value, { stream: true });
+      out.textContent = cleanAnswer(text) || "Thinking…";
+    }
+    if (!cleanAnswer(text)) out.textContent = "The model returned an empty answer. Click the word again.";
+  } catch (err) {
+    if (err.name === "AbortError") return;
+    lastKey = null;   // allow retry
+    out.classList.add("muted");
+    out.textContent = "⚠ " + err.message;
+  }
+}
+
+// ---------- input / read view ----------
+function showReader() {
+  const text = $("input").value;
+  if (!text.trim()) return;
+  store.set("text", text);
+  render(text);
+  $("inputView").classList.add("hidden");
+  $("readView").classList.remove("hidden");
+}
+$("readBtn").onclick = showReader;
+$("editBtn").onclick = () => {
+  $("readView").classList.add("hidden");
+  $("inputView").classList.remove("hidden");
+};
+$("model").onchange = () => { store.set("model", $("model").value); lastKey = null; };
+
+async function loadModels() {
+  try {
+    const res = await fetch("/api/models");
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error);
+    if (!d.models.length) throw new Error("Ollama has no models. Run: ollama pull qwen2.5:7b");
+    const saved = store.get("model");
+    const pick = d.models.includes(saved) ? saved : d.default;
+    for (const m of d.models) $("model").add(new Option(m, m, false, m === pick));
+    $("model").value = pick;
+    $("status").textContent = "";
+    } catch (err) {
+    const msg = (location.protocol === "file:" || err instanceof TypeError)
+      ? "Not connected to server.py. Open the page via http://localhost:8000."
+      : err.message;
+    $("status").textContent = "⚠ " + msg;
+    $("output").textContent = "⚠ " + msg;
+  }
+}
+
+loadModels();
+const savedText = store.get("text");
+if (savedText) { $("input").value = savedText; showReader(); }
+</script>
+</body>
+</html>

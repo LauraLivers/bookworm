@@ -125,10 +125,7 @@ $("reader").addEventListener("mouseup", e => {
 });
 
 // ---------- asking the backend ----------
-function cleanAnswer(t) {
-  // Remove any <think>…</think> block some models emit
-  return t.replace(/<think>[\s\S]*?(<\/think>|$)/g, "").trim();
-}
+function cleanAnswer(t) { return t.trim(); }
 
 async function explain(word, sFrom, sTo = sFrom) {
   word = word.replace(/\s+/g, " ");
